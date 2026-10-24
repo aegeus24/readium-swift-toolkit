@@ -19,10 +19,12 @@ let package = Package(
         .library(name: "ReadiumLCP", targets: ["ReadiumLCP"]),
 
         // Adapters to third-party dependencies.
+        .library(name: "ReadiumAdapterRAR", targets: ["ReadiumAdapterRAR"]),
         .library(name: "ReadiumAdapterGCDWebServer", targets: ["ReadiumAdapterGCDWebServer"]),
         .library(name: "ReadiumAdapterLCPSQLite", targets: ["ReadiumAdapterLCPSQLite"]),
     ],
     dependencies: [
+        .package(url: "https://github.com/mtgto/Unrar.swift.git", exact: "0.5.4"),
         .package(url: "https://github.com/krzyzanowskim/CryptoSwift.git", from: "1.10.0"),
         .package(url: "https://github.com/marmelroy/Zip.git", from: "2.1.2"),
         .package(url: "https://github.com/ra1028/DifferenceKit.git", from: "1.3.0"),
@@ -34,6 +36,15 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.5.0"),
     ],
     targets: [
+        .target(
+            name: "ReadiumAdapterRAR",
+            dependencies: ["ReadiumShared", .product(name: "Unrar", package: "unrar.swift")],
+            path: "Sources/Adapters/RAR"
+        ),
+        .testTarget(
+            name: "ReadiumAdapterRARTests", dependencies: ["ReadiumAdapterRAR"],
+            path: "Tests/AdapterRARTests", resources: [.copy("Fixtures")]
+        ),
         .target(
             name: "ReadiumShared",
             dependencies: [
