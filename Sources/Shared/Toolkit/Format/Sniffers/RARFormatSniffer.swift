@@ -29,10 +29,9 @@ public struct RARFormatSniffer: FormatSniffer {
         // https://en.wikipedia.org/wiki/List_of_file_signatures
         return await blob.read(range: 0 ..< 8)
             .map { data in
-                guard
-                    data.count > 8,
-                    data[0 ..< 7] == Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]) ||
-                    data == Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00])
+                let rar4 = Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00])
+                let rar5 = Data([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00])
+                guard data.starts(with: rar4) || data.starts(with: rar5)
                 else {
                     return nil
                 }

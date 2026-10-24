@@ -383,6 +383,20 @@ class FormatSniffersTests: XCTestCase {
         XCTAssertEqual(sut.sniffHints(fileExtension: "rar"), rar)
     }
 
+    func testSniffRARSignatures() async throws {
+        let sniffer = RARFormatSniffer()
+        let rar4: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]
+        let rar5: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]
+        for bytes in [rar4, rar4 + [0xCF, 0x90], rar5, rar5 + [0x42]] {
+            let format = try await sniffer.sniffBlob(DataResource(data: Data(bytes))).get()
+            XCTAssertEqual(format?.mediaType, .rar)
+        }
+        for bytes in [Array(rar4.prefix(6)), Array(rar5.prefix(7)), [UInt8](repeating: 0, count: 8)] {
+            let format = try await sniffer.sniffBlob(DataResource(data: Data(bytes))).get()
+            XCTAssertNil(format)
+        }
+    }
+
     func testSniffXHTML() async {
         XCTAssertEqual(sut.sniffHints(mediaType: .xhtml), .xhtml)
         XCTAssertEqual(sut.sniffHints(fileExtension: "xhtml"), .xhtml)
