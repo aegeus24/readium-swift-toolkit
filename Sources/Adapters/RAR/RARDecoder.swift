@@ -131,7 +131,7 @@ public enum RARDecoder {
             do {
                 try Task.checkCancellation()
                 guard p2 >= 0, let bytes = UnsafeRawPointer(bitPattern: p1) else { throw Failure.invalid("Invalid RAR output buffer.") }
-                try context.consume(Data(bytes: bytes, count: p2))
+                try context.consume(bytes: bytes, count: p2)
                 return 0
             } catch { context.failure = error; return -1 }
         case UCM_NEEDPASSWORD.rawValue, UCM_NEEDPASSWORDW.rawValue:
@@ -158,13 +158,16 @@ public enum RARDecoder {
             guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
             handle = try FileHandle(forWritingTo: url)
         }
-        func consume(_ data: Data) throws {
-            let count = UInt64(data.count)
-            guard count <= expected - entryBytes, count <= limits.maxEntryBytes - entryBytes,
-                  count <= limits.maxExpandedBytes - total else { throw Failure.invalid("A RAR entry expands beyond its allowed size.") }
-            entryBytes += count
-            total += count
+        func consume(bytes: UnsafeRawPointer, count: Int) throws {
+            let size = UInt64(count)
+            guard size <= expected - entryBytes, size <= limits.maxEntryBytes - entryBytes,
+                  size <= limits.maxExpandedBytes - total else { throw Failure.invalid("A RAR entry expands beyond its allowed size.") }
+            entryBytes += size
+            total += size
             guard let handle else { throw Failure.invalid("Unexpected RAR output outside a file entry.") }
+            // Write synchronously while UnRAR owns this buffer. Avoid copying a
+            // decoder-sized block, and validate its length before wrapping it.
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: bytes), count: count, deallocator: .none)
             try handle.write(contentsOf: data)
         }
         func finish() throws {
