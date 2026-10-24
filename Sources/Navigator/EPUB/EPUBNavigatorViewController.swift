@@ -44,6 +44,62 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         case serverFailure(Error)
     }
 
+    /// Curl uses temporary leaf snapshots and retains the live HTML view at rest.
+    public var pageTurnStyle: EPUBPageTurnStyle = .slide {
+        didSet { if oldValue != pageTurnStyle { pageTurnAnimator.invalidate(); applySettings() } }
+    }
+    private let pageTurnAnimator = EPUBPageTurnAnimator()
+    private var curlSwipes: [UISwipeGestureRecognizer] = []
+    private var pageTurnViewSize = CGSize.zero
+
+    /// Physical spine selected for the current paginated layout.
+    public var pageTurnSpineLocation: UIPageViewController.SpineLocation {
+        settings.columnCount == .two && view.bounds.width >= 560 && !settings.scroll && !settings.verticalText ? .mid : .min
+    }
+
+    private func configurePageTurnInput() {
+        if curlSwipes.isEmpty {
+            for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+                let swipe = UISwipeGestureRecognizer(target: self, action: #selector(didSwipeForCurl(_:)))
+                swipe.direction = direction
+                swipe.cancelsTouchesInView = false
+                view.addGestureRecognizer(swipe)
+                curlSwipes.append(swipe)
+            }
+        }
+        let curl = pageTurnStyle != .slide && !settings.scroll && !settings.verticalText
+        curlSwipes.forEach { $0.isEnabled = curl }
+        for (_, loaded) in paginationView?.loadedViews ?? [:] {
+            (loaded as? EPUBSpreadView)?.scrollView.isScrollEnabled = !curl
+        }
+    }
+
+    @objc private func didSwipeForCurl(_ gesture: UISwipeGestureRecognizer) {
+        guard gesture.state == .ended, currentSelection == nil else { return }
+        let forward = (gesture.direction == .left) != (settings.readingProgression == .rtl)
+        Task { if forward { await goForward(options: .init(animated: true)) }
+               else { await goBackward(options: .init(animated: true)) } }
+    }
+
+    private func pageTurnSnapshot() async -> UIImage? {
+        guard let spread = paginationView?.currentView as? EPUBSpreadView,
+              view.window != nil, view.bounds.width > 0, view.bounds.height > 0 else { return nil }
+        let configuration = WKSnapshotConfiguration()
+        configuration.afterScreenUpdates = true
+        configuration.snapshotWidth = NSNumber(value: min(spread.webView.bounds.width, 1024))
+        guard let webImage = try? await spread.webView.takeSnapshot(configuration: configuration) else { return nil }
+        // Bound temporary textures on large displays. Each turn retains only two spreads.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = min(view.window?.screen.scale ?? 2, 2)
+        format.opaque = true
+        let rect = spread.webView.convert(spread.webView.bounds, to: view)
+        return UIGraphicsImageRenderer(size: view.bounds.size, format: format).image { context in
+            (view.backgroundColor ?? .white).setFill()
+            context.fill(view.bounds)
+            webImage.draw(in: rect)
+        }
+    }
+
     public struct Configuration {
         /// Initial set of setting preferences.
         public var preferences: EPUBPreferences
@@ -462,7 +518,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         viewModel.viewSizeWillChange(view.bounds.size)
     }
 
+    override open func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        if pageTurnViewSize != .zero, pageTurnViewSize != view.bounds.size {
+            pageTurnAnimator.invalidate()
+        }
+        pageTurnViewSize = view.bounds.size
+    }
+
+    override open func viewWillDisappear(_ animated: Bool) {
+        pageTurnAnimator.invalidate()
+        super.viewWillDisappear(animated)
+    }
+
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        pageTurnAnimator.invalidate()
         super.viewWillTransition(to: size, with: coordinator)
 
         if isActive {
@@ -511,6 +581,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Goes to the next or previous page in the given scroll direction.
     private func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+        guard !pageTurnAnimator.busy else { return false }
+        if pageTurnStyle == .curl, options.animated, !settings.scroll, !settings.verticalText, !UIAccessibility.isReduceMotionEnabled {
+            return await pageTurnAnimator.turn(in: self, centerSpine: pageTurnSpineLocation == .mid,
+                                              direction: direction == .right ? .forward : .reverse,
+                                              snapshot: { await self.pageTurnSnapshot() },
+                                              move: { await self.move(to: direction, options: .none) })
+        }
+        let options = pageTurnStyle == .instant || UIAccessibility.isReduceMotionEnabled ? NavigatorGoOptions.none : options
+        return await move(to: direction, options: options)
+    }
+
+    private func move(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
         guard
             let paginationView = paginationView,
             on(.move(direction))
@@ -654,6 +736,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private var isPaginationViewScrollingEnabled: Bool {
         !(config.disablePageTurnsWhileScrolling && settings.scroll)
+            && !(pageTurnStyle != .slide && !settings.scroll && !settings.verticalText)
     }
 
     public var presentation: VisualNavigatorPresentation {
@@ -903,6 +986,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
+        pageTurnAnimator.invalidate()
         viewModel.submitPreferences(preferences)
         applySettings()
 
@@ -922,6 +1006,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         view.backgroundColor = settings.effectiveBackgroundColor.uiColor
         paginationView?.isScrollEnabled = isPaginationViewScrollingEnabled
+        configurePageTurnInput()
     }
 
     // MARK: - EPUB-specific extensions
@@ -1045,6 +1130,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
+        configurePageTurnInput()
         let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
             styles[item.key.rawValue] = .object(item.value.jsonObject)
         }
