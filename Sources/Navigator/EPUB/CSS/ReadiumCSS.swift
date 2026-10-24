@@ -66,11 +66,28 @@ extension ReadiumCSS {
             ligatures: settings.ligatures.map { $0 ? .common : .none },
             a11yNormalize: settings.textNormalization,
             overrides: [
+                // Explicit column preferences must not be gated by Readium CSS's
+                // legacy device/orientation media queries. The host selects a
+                // readable viewport; column-width must be reset as well, or its
+                // 45em floor can still collapse an explicit two-column request.
+                "column-count": explicitColumnCount(settings),
+                "-webkit-column-count": explicitColumnCount(settings),
+                "column-width": explicitColumnCount(settings).isEmpty ? "" : "auto",
+                "-webkit-column-width": explicitColumnCount(settings).isEmpty ? "" : "auto",
                 "font-weight": settings.fontWeight
                     .map { String(format: "%.0f", (Double(CSSStandardFontWeight.normal.rawValue) * $0).clamped(to: 1 ... 1000)) }
                     ?? "",
             ]
         )
+    }
+
+    private func explicitColumnCount(_ settings: EPUBSettings) -> String {
+        guard !settings.scroll, !settings.verticalText else { return "" }
+        switch settings.columnCount {
+        case .one: return "1"
+        case .two: return "2"
+        case .auto: return ""
+        }
     }
 
     func resolveFontStack(of fontFamily: FontFamily) -> [String] {
