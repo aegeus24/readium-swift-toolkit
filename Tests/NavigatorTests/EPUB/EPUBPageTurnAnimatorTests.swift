@@ -55,12 +55,112 @@ final class EPUBPageTurnAnimatorTests: XCTestCase {
             turns.pageViewController(pager, willTransitionTo: next)
             pager.setViewControllers(next, direction: .forward, animated: false)
             turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: true)
-            for _ in 0..<30 where turns.busy { await Task.yield() }
-            XCTAssertEqual(commits, 1); XCTAssertNil(turns.pager)
+            await turns.waitUntilSynchronized()
+            XCTAssertEqual(commits, 1); XCTAssertTrue(turns.pager === pager)
+            XCTAssertEqual(turns.currentIndex, 1)
+            XCTAssertEqual(turns.synchronizedIndex, 1)
             turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: true)
             XCTAssertEqual(commits, 1, "Late UIKit callbacks cannot commit twice")
+            XCTAssertEqual(parent.children.count, 1)
+            turns.invalidate()
             XCTAssertTrue(parent.children.isEmpty)
         }
+    }
+
+    func testRollingCacheAllowsRapidTurnsWhileHTMLIsStillSynchronizing() async throws {
+        for split in [false, true] {
+            let parent = UIViewController()
+            parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+            let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+            let image = UIGraphicsImageRenderer(size: parent.view.bounds.size).image { _ in }
+            let turns = EPUBInteractivePageTurnController()
+            var firstCommit: CheckedContinuation<Bool, Never>?
+            var commits: [Int] = []
+            turns.install(in: parent, liveView: live, current: image, previous: nil,
+                          next: .init(image: image, commit: {
+                              commits.append(1)
+                              return await withCheckedContinuation { firstCommit = $0 }
+                          }), centerSpine: split)
+            turns.insert(.init(image: image, commit: { commits.append(2); return true }), at: 2)
+            let pager = try XCTUnwrap(turns.pager)
+            func completeForward() throws {
+                let current = try XCTUnwrap(pager.viewControllers)
+                let front = try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: try XCTUnwrap(current.last)))
+                var target = [front]
+                if split { target.append(try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: front))) }
+                turns.pageViewController(pager, willTransitionTo: target)
+                pager.setViewControllers(target, direction: .forward, animated: false)
+                turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: true)
+            }
+            try completeForward()
+            while firstCommit == nil { await Task.yield() }
+            XCTAssertTrue(turns.hasPendingSynchronization)
+            XCTAssertFalse(turns.busy, "HTML work must not block the next native drag")
+            try completeForward()
+            XCTAssertEqual(turns.currentIndex, 2)
+            XCTAssertEqual(turns.synchronizedIndex, 0)
+            XCTAssertTrue(turns.pager === pager, "No controller reload between cached turns")
+            XCTAssertTrue(parent.view.subviews.last === pager.view, "Keep the completed cached destination visible until HTML catches up")
+            firstCommit?.resume(returning: true)
+            await turns.waitUntilSynchronized()
+            XCTAssertEqual(commits, [1, 2])
+            XCTAssertEqual(turns.synchronizedIndex, 2)
+            XCTAssertTrue(parent.view.subviews.last === live)
+            XCTAssertTrue(turns.pager === pager)
+            turns.invalidate()
+        }
+    }
+
+    func testCachedButtonAnimationCancellationResumesCallerWithoutCommitting() async throws {
+        let parent = UIViewController(); parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+        let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+        let image = UIGraphicsImageRenderer(size: parent.view.bounds.size).image { _ in }
+        let turns = EPUBInteractivePageTurnController()
+        var commits = 0
+        turns.install(in: parent, liveView: live, current: image, previous: nil,
+                      next: .init(image: image, commit: { commits += 1; return true }), centerSpine: true)
+        let task = Task { await turns.turn(right: true) }
+        await Task.yield()
+        turns.invalidate()
+        let completed = await task.value
+        XCTAssertFalse(completed)
+        XCTAssertEqual(commits, 0)
+    }
+
+    func testFailedCachedSynchronizationRollsBackWithoutDestroyingPager() async throws {
+        let parent = UIViewController(); parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+        let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+        let image = UIGraphicsImageRenderer(size: parent.view.bounds.size).image { _ in }
+        let turns = EPUBInteractivePageTurnController()
+        turns.install(in: parent, liveView: live, current: image, previous: nil,
+                      next: .init(image: image, commit: { false }), centerSpine: true)
+        let pager = try XCTUnwrap(turns.pager), visible = try XCTUnwrap(pager.viewControllers)
+        let first = try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: try XCTUnwrap(visible.last)))
+        let second = try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: first))
+        turns.pageViewController(pager, willTransitionTo: [first, second])
+        pager.setViewControllers([first, second], direction: .forward, animated: false)
+        turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: visible, transitionCompleted: true)
+        await turns.waitUntilSynchronized()
+        XCTAssertEqual(turns.currentIndex, 0); XCTAssertEqual(turns.synchronizedIndex, 0)
+        XCTAssertTrue(turns.pager === pager)
+        XCTAssertTrue(parent.view.subviews.last === live)
+        turns.invalidate()
+    }
+
+    func testRollingCacheBoundsAndMemoryPressureKeepCurrentLeaf() throws {
+        let parent = UIViewController(); parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+        let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+        let format = UIGraphicsImageRendererFormat(); format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 1600, height: 1600), format: format).image { _ in }
+        let turns = EPUBInteractivePageTurnController()
+        turns.install(in: parent, liveView: live, current: image, previous: nil, next: nil, centerSpine: false)
+        for index in -8...8 { turns.insert(.init(image: image, commit: { true }), at: index) }
+        XCTAssertEqual(turns.cachedIndices, [-2, -1, 0, 1, 2])
+        XCTAssertLessThanOrEqual(turns.cachedImageBytes, EPUBInteractivePageTurnController.byteLimit)
+        XCTAssertEqual(try XCTUnwrap(turns.pager).spineLocation, .min)
+        turns.trim(radius: 0)
+        XCTAssertEqual(turns.cachedIndices, [0])
+        turns.invalidate()
     }
 
     func testInteractiveInvalidationRejectsLateCompletion() async throws {

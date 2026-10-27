@@ -134,6 +134,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
+    /// Offscreen preview WebViews can defer the requestAnimationFrame message.
+    /// Read the same DOM coordinates synchronously before caching a viewport.
+    func refreshViewportProgression() async -> Bool {
+        guard case .success(let result) = await evaluateScript("""
+        (() => { const width=document.scrollingElement.scrollWidth;
+          if(width<=0)return null;const x=Math.abs(window.scrollX);
+          return [Math.min(1,x/width),Math.min(1,(x+innerWidth)/width)]; })()
+        """), let bounds = result as? [Double], bounds.count == 2,
+              bounds[0].isFinite, bounds[1].isFinite, bounds[0] <= bounds[1] else { return false }
+        progression = bounds[0]...bounds[1]
+        previousProgression = nil
+        return true
+    }
+
     override func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
         guard
             spread.first.index == index,

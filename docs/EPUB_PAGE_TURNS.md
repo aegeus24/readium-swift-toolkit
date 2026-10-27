@@ -1,19 +1,27 @@
-# Native EPUB page turns
+# Rolling native EPUB page turns
 
-The fork adds `EPUBNavigatorViewController.pageTurnStyle`: slide (default), curl, and instant. Vertical scrolling/text retain their renderer. Reduce Motion skips curls. Active text selection disables interactive curl input; native tap recognizers are disabled so Readium continues to filter interactive HTML and dispatch edge taps.
+`EPUBNavigatorViewController.pageTurnStyle` offers slide, curl and instant. Curl uses a persistent UIPageViewController and a rolling viewport-image cache. Vertical scrolling/text, VoiceOver and Reduce Motion retain their existing non-curl paths.
 
-## Interactive dragging
+## Visible pages and background synchronization
 
-Curl mode prepares current and adjacent viewport images using one short-lived preview navigator with no application delegate and no neighboring resource preloads. It never navigates the live publication during preparation. At most three spread images are retained by the interactive cache; preview views are removed after preparation and immediately on invalidation. Snapshot textures are bounded by the existing capture path.
+Native dragging, reversal and cancellation use the same pager throughout a reading run. A completed turn advances to its already-cached image immediately; the pager remains available for another cached turn while the live HTML renderer catches up. HTML navigation is serialized and coalesces to the latest completed destination. Cached images stay above HTML until it reaches the displayed page and its rendering is fenced with a WebKit snapshot. Live HTML then returns above the pager for links, selection and accessibility. Native tap recognizers are disabled; normal edge taps remain Readium's responsibility. During background synchronization a cache-surface edge tap can start another cached turn.
 
-A native UIPageViewController uses these snapshots as its data source. Its public gesture recognizers are attached to the containing navigator view. Live HTML sits above the raster controller at rest, retaining links, selection and accessibility. Once a native transition starts, the raster surfaces move above live HTML and follow UIKit's finger-tracked page curl, including pause, reversal and cancellation. Two columns use separate physical halves with a middle spine; one column uses a minimum spine. Adjacent controllers are mapped by physical side, independent of reading direction.
+Completed cached destinations publish semantic locations immediately, so persistence does not wait for WebKit. Cancelled gestures publish nothing. Call `waitForPendingPageTurns()` before capturing text from the live renderer; `hasPendingPageTurns` indicates that it is behind. Locator jumps cancel/drain old synchronization before navigating elsewhere. Resizing, preferences and disappearance invalidate stale images and preserve the last completed cached destination. Duplicate/stale UIKit callbacks cannot navigate again. Failed synchronization rolls back to the last synchronized leaf.
 
-Cancellation reveals the unchanged live renderer. Only `transitionCompleted` commits one corresponding live Readium move; the snapshot remains above it while that move finishes. Invalidated/duplicate callbacks cannot commit another page. Rotation, view resizing, settings changes, disappearance and direct locator jumps invalidate pending previews and native curl surfaces. A new cache is prepared after the current location settles. A drag requires prepared neighboring snapshots; navigation buttons and edge taps remain available during preparation.
+Buttons and edge taps use cached native animation when their target is ready, with the old snapshot-animation fallback available when it is not. Invalidation resumes pending programmatic-animation callers even if UIKit omits its completion callback.
 
-## Programmatic navigation
+## Rolling window and memory
 
-Buttons and edge taps keep the before/after snapshot animation. Their short-lived animation controllers are distinct from the idle interactive pager. Slide, instant, selection, links, semantic locators and TOC remain owned by Readium.
+Default radius is **two spreads in each physical direction**, plus the current spread. In two-column mode each spread is two pages, so this buffers two complete page turns/four pages in each direction. Both physical halves remain printed native front/back leaves at a middle spine. Compact mode advances one logical page per turn and retains UIKit's native paper reverse.
 
-## Verification and limits
+One warm, noninteractive preview navigator, with no application delegate and zero resource preloads, renders missing edge images. It reuses loaded resources and prioritizes the nearest missing viewport in the reading direction. Existing images and the pager are not rebuilt on every turn. Offscreen WebViews can defer their animation-frame progress messages; cache positions are refreshed from the same DOM scroll coordinates used by Readium before pairing a locator with its image.
 
-Mirrored app tests cover physical half images, native data-source adjacency, cancelled/completed transitions, duplicate and invalidated callbacks, and real WebKit navigation in one/two columns and LTR/RTL. Existing chapter crossings, programmatic curls and reflow tests remain relevant. Manual slow-drag, gesture arbitration around links/text selection and fold interruption still need physical-device validation. First-drag readiness, snapshot preparation latency and memory should be profiled with large publications. The upstream test script requires the generated TestApp project and xcbeautify; app-side mirrored tests do not imply a full upstream-suite pass.
+Images have a 1600-pixel longest dimension. The bitmap dictionary is capped at **64 MiB**, trimming farthest entries first while protecting the visible, pending and last-synchronized leaves. Normally there are five spread images; an older synchronized leaf can remain briefly protected during rapid turns. UIKit/GPU working surfaces and WebKit memory are additional, not included in that dictionary budget. A memory warning discards neighbors and the warm preview, preserving the visible/completing leaf. Refill resumes on user navigation. Fonts, themes, margins, layout, geometry and explicit jumps clear incompatible images.
+
+Five spreads each way would retain eleven images before temporary surfaces and is not the default. Profile actual device latency and memory before raising the window.
+
+## Verification
+
+Mirrored app tests cover persistent pager identity, two rapid turns while the first HTML commit is suspended, cancellation, synchronization failure/rollback, duplicate/invalidated callbacks, programmatic cancellation, cache bounds and memory-pressure trimming. Live WebKit integration exercises immediate multi-turn display, forward/backward navigation, edge refill, LTR/RTL, middle/minimum spines and persisted positions. Bookmark and reflow callers wait for HTML synchronization before reading text anchors.
+
+The upstream runner requires the generated TestApp project and xcbeautify; mirrored app tests do not imply a full upstream-suite pass. Physical slow-drag/fast-flip feel, gesture arbitration, fold interruption and memory profiling remain device checks.
