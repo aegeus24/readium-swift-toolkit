@@ -46,9 +46,95 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Curl uses temporary leaf snapshots and retains the live HTML view at rest.
     public var pageTurnStyle: EPUBPageTurnStyle = .slide {
-        didSet { if oldValue != pageTurnStyle { pageTurnAnimator.invalidate(); applySettings() } }
+        didSet { if oldValue != pageTurnStyle { invalidatePageTurns(); applySettings() } }
     }
     private let pageTurnAnimator = EPUBPageTurnAnimator()
+    private let interactivePageTurns = EPUBInteractivePageTurnController()
+    private var previewTask: Task<Void, Never>?
+    private weak var previewNavigator: EPUBNavigatorViewController?
+    private var interactiveLocation: Locator?
+    private var interactiveGeneration = 0
+
+    private func invalidatePageTurns() {
+        pageTurnAnimator.invalidate()
+        interactiveGeneration += 1
+        previewTask?.cancel(); previewTask = nil
+        if let preview = previewNavigator {
+            preview.willMove(toParent: nil); preview.view.removeFromSuperview(); preview.removeFromParent()
+            previewNavigator = nil
+        }
+        interactiveLocation = nil
+        interactivePageTurns.invalidate()
+    }
+
+    private func scheduleInteractivePageTurns() {
+        guard pageTurnStyle == .curl, !settings.scroll, !settings.verticalText,
+              !UIAccessibility.isReduceMotionEnabled, !UIAccessibility.isVoiceOverRunning,
+              !pageTurnAnimator.busy, !interactivePageTurns.busy,
+              view.window != nil, let location = currentLocation,
+              interactiveLocation != location else { return }
+        interactiveGeneration += 1
+        let revision = interactiveGeneration
+        previewTask?.cancel()
+        interactivePageTurns.invalidate()
+        interactiveLocation = location
+        previewTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+                guard revision == self.interactiveGeneration, let live = self.paginationView,
+                      let current = await self.pageTurnSnapshot() else { return }
+                var config = self.config
+                config.preferences = self.viewModel.preferences
+                config.preloadPreviousPositionCount = 0
+                config.preloadNextPositionCount = 0
+                let preview = try EPUBNavigatorViewController(publication: self.publication, initialLocation: location,
+                                                            readingOrder: self.readingOrder, config: config)
+                self.previewNavigator = preview
+                preview.loadViewIfNeeded()
+                preview.view.frame = self.view.bounds
+                preview.view.isUserInteractionEnabled = false
+                preview.view.accessibilityElementsHidden = true
+                self.addChild(preview)
+                self.view.insertSubview(preview.view, at: 0)
+                preview.didMove(toParent: self)
+                defer {
+                    if preview.parent != nil {
+                        preview.willMove(toParent: nil); preview.view.removeFromSuperview(); preview.removeFromParent()
+                    }
+                    if self.previewNavigator === preview { self.previewNavigator = nil }
+                }
+                await preview.initialized()
+                try Task.checkCancellation()
+                guard await preview.go(to: location, options: .none) else { return }
+                var pages: [EPUBSpreadView.Direction: EPUBInteractivePageTurnController.Page] = [:]
+                for direction in [EPUBSpreadView.Direction.left, .right] {
+                    try Task.checkCancellation()
+                    guard revision == self.interactiveGeneration else { return }
+                    guard await preview.go(to: location, options: .none), await preview.move(to: direction, options: .none),
+                          let image = await preview.pageTurnSnapshot() else { continue }
+                    pages[direction] = .init(image: image, commit: { [weak self] in
+                        guard let self, revision == self.interactiveGeneration else { return false }
+                        return await self.move(to: direction, options: .none)
+                    })
+                }
+                try Task.checkCancellation()
+                guard revision == self.interactiveGeneration, self.view.window != nil else { return }
+                self.interactivePageTurns.canBegin = { [weak self] in
+                    guard let self else { return false }
+                    return self.currentSelection == nil && self.pageTurnStyle == .curl &&
+                        !self.settings.scroll && !self.settings.verticalText && !UIAccessibility.isReduceMotionEnabled
+                }
+                self.interactivePageTurns.didComplete = { [weak self] in
+                    self?.interactiveLocation = nil
+                    self?.scheduleInteractivePageTurns()
+                }
+                self.interactivePageTurns.install(in: self, liveView: live, current: current,
+                                                  previous: pages[.left], next: pages[.right],
+                                                  centerSpine: self.pageTurnSpineLocation == .mid)
+            } catch { }
+        }
+    }
     private var curlSwipes: [UISwipeGestureRecognizer] = []
     private var pageTurnViewSize = CGSize.zero
 
@@ -68,7 +154,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
         }
         let curl = pageTurnStyle != .slide && !settings.scroll && !settings.verticalText
-        curlSwipes.forEach { $0.isEnabled = curl }
+        curlSwipes.forEach { $0.isEnabled = curl && (pageTurnStyle == .instant || UIAccessibility.isReduceMotionEnabled) }
+        scheduleInteractivePageTurns()
         for (_, loaded) in paginationView?.loadedViews ?? [:] {
             (loaded as? EPUBSpreadView)?.scrollView.isScrollEnabled = !curl
         }
@@ -521,18 +608,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     override open func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         if pageTurnViewSize != .zero, pageTurnViewSize != view.bounds.size {
-            pageTurnAnimator.invalidate()
+            invalidatePageTurns()
         }
         pageTurnViewSize = view.bounds.size
+        scheduleInteractivePageTurns()
     }
 
     override open func viewWillDisappear(_ animated: Bool) {
-        pageTurnAnimator.invalidate()
+        invalidatePageTurns()
         super.viewWillDisappear(animated)
     }
 
     override open func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
-        pageTurnAnimator.invalidate()
+        invalidatePageTurns()
         super.viewWillTransition(to: size, with: coordinator)
 
         if isActive {
@@ -581,12 +669,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Goes to the next or previous page in the given scroll direction.
     private func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
-        guard !pageTurnAnimator.busy else { return false }
+        guard !pageTurnAnimator.busy, !interactivePageTurns.busy else { return false }
+        invalidatePageTurns()
         if pageTurnStyle == .curl, options.animated, !settings.scroll, !settings.verticalText, !UIAccessibility.isReduceMotionEnabled {
-            return await pageTurnAnimator.turn(in: self, centerSpine: pageTurnSpineLocation == .mid,
+            let moved = await pageTurnAnimator.turn(in: self, centerSpine: pageTurnSpineLocation == .mid,
                                               direction: direction == .right ? .forward : .reverse,
                                               snapshot: { await self.pageTurnSnapshot() },
                                               move: { await self.move(to: direction, options: .none) })
+            scheduleInteractivePageTurns()
+            return moved
         }
         let options = pageTurnStyle == .instant || UIAccessibility.isReduceMotionEnabled ? NavigatorGoOptions.none : options
         return await move(to: direction, options: options)
@@ -806,9 +897,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             notifiedCurrentLocation = location
             delegate.navigator(self, locationDidChange: location)
         }
+        scheduleInteractivePageTurns()
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        invalidatePageTurns()
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -986,7 +1079,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
-        pageTurnAnimator.invalidate()
+        invalidatePageTurns()
         viewModel.submitPreferences(preferences)
         applySettings()
 
@@ -1293,6 +1386,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect) {
+        interactivePageTurns.setInputEnabled(text == nil)
         guard
             let locator = currentLocation,
             let text = text

@@ -26,6 +26,62 @@ final class EPUBPageTurnAnimatorTests: XCTestCase {
         }
     }
 
+    func testInteractiveCancellationDoesNotCommitAndCompletionCommitsOnce() async throws {
+        for split in [false, true] {
+            let parent = UIViewController()
+            parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+            let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+            let image = UIGraphicsImageRenderer(size: parent.view.bounds.size).image { _ in }
+            var commits = 0
+            let turns = EPUBInteractivePageTurnController()
+            turns.install(in: parent, liveView: live, current: image, previous: nil,
+                          next: .init(image: image, commit: { commits += 1; return true }), centerSpine: split)
+            let pager = try XCTUnwrap(turns.pager)
+            XCTAssertEqual(pager.spineLocation, split ? .mid : .min)
+            XCTAssertFalse(pager.gestureRecognizers.filter(\.isEnabled).isEmpty)
+            XCTAssertTrue(pager.gestureRecognizers.allSatisfy { $0.view === parent.view })
+            XCTAssertNil(turns.pageViewController(pager, viewControllerBefore: try XCTUnwrap(pager.viewControllers?.first)))
+            let current = try XCTUnwrap(pager.viewControllers)
+            let first = try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: try XCTUnwrap(current.last)))
+            var next = [first]
+            if split { next.append(try XCTUnwrap(turns.pageViewController(pager, viewControllerAfter: first))) }
+            turns.pageViewController(pager, willTransitionTo: next)
+            XCTAssertTrue(turns.busy)
+            XCTAssertEqual(commits, 0)
+            XCTAssertTrue(parent.view.subviews.last === pager.view)
+            turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: false)
+            XCTAssertEqual(commits, 0); XCTAssertFalse(turns.busy)
+            XCTAssertTrue(parent.view.subviews.last === live)
+            turns.pageViewController(pager, willTransitionTo: next)
+            pager.setViewControllers(next, direction: .forward, animated: false)
+            turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: true)
+            for _ in 0..<30 where turns.busy { await Task.yield() }
+            XCTAssertEqual(commits, 1); XCTAssertNil(turns.pager)
+            turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: current, transitionCompleted: true)
+            XCTAssertEqual(commits, 1, "Late UIKit callbacks cannot commit twice")
+            XCTAssertTrue(parent.children.isEmpty)
+        }
+    }
+
+    func testInteractiveInvalidationRejectsLateCompletion() async throws {
+        let parent = UIViewController()
+        parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)
+        let live = UIView(frame: parent.view.bounds); parent.view.addSubview(live)
+        let image = UIGraphicsImageRenderer(size: parent.view.bounds.size).image { _ in }
+        let turns = EPUBInteractivePageTurnController()
+        var commits = 0
+        turns.install(in: parent, liveView: live, current: image, previous: nil,
+                      next: .init(image: image, commit: { commits += 1; return true }), centerSpine: true)
+        let pager = try XCTUnwrap(turns.pager)
+        turns.pageViewController(pager, willTransitionTo: [])
+        turns.invalidate()
+        turns.pageViewController(pager, didFinishAnimating: true, previousViewControllers: [], transitionCompleted: true)
+        await Task.yield()
+        XCTAssertEqual(commits, 0); XCTAssertFalse(turns.busy)
+        XCTAssertTrue(parent.children.isEmpty)
+        XCTAssertTrue(parent.view.gestureRecognizers?.isEmpty ?? true)
+    }
+
     func testFailedMoveLeavesNoOverlayAndUnlocksNextTurn() async {
         let parent = UIViewController()
         parent.view.frame = CGRect(x: 0, y: 0, width: 800, height: 700)

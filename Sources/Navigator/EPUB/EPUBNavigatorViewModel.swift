@@ -202,7 +202,7 @@ enum EPUBScriptScope {
     private(set) var settings: EPUBSettings
 
     /// Last submitted preferences.
-    private var preferences: EPUBPreferences
+    private(set) var preferences: EPUBPreferences
 
     func submitPreferences(_ preferences: EPUBPreferences) {
         self.preferences = preferences
