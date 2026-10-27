@@ -296,6 +296,31 @@ export function rangeFromLocator(locator) {
   try {
     let locations = locator.locations;
     let text = locator.text;
+    // Prefer the exact source range. Quoted text alone is ambiguous when a
+    // publication repeats the same passage and surrounding context.
+    if (locations && locations.domRange) {
+      try {
+        const points = locations.domRange;
+        const boundary = (point) => {
+          const element = document.querySelector(point.cssSelector);
+          if (!element) throw new Error("Missing range element");
+          const node = element.childNodes[point.textNodeIndex];
+          if (!node) throw new Error("Missing range node");
+          return [node, point.charOffset ?? point.offset ?? 0];
+        };
+        const range = document.createRange();
+        range.setStart(...boundary(points.start));
+        range.setEnd(...boundary(points.end || points.start));
+        if (
+          !range.collapsed &&
+          (!text?.highlight || range.toString() === text.highlight)
+        ) {
+          return range;
+        }
+      } catch (_) {
+        // Changed markup can still recover using the quote and context below.
+      }
+    }
     if (text && text.highlight) {
       var root;
       if (locations && locations.cssSelector) {

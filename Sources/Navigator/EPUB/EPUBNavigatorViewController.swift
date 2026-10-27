@@ -110,7 +110,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func scheduleInteractivePageTurns() {
         guard pageTurnStyle == .curl, !settings.scroll, !settings.verticalText, pageTurnsVisible,
               !UIAccessibility.isReduceMotionEnabled, !UIAccessibility.isVoiceOverRunning,
-              !pageTurnAnimator.busy, previewTask == nil, cachedRestoreTask == nil, !cacheUnderMemoryPressure,
+              !pageTurnAnimator.busy, previewTask == nil, cachedRestoreTask == nil, decorationTasks.isEmpty, !cacheUnderMemoryPressure,
               view.window != nil, let location = currentLocation else { return }
         let current = interactivePageTurns.currentIndex
         let targets = (current - EPUBInteractivePageTurnController.radius ... current + EPUBInteractivePageTurnController.radius)
@@ -174,6 +174,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     preview.view.isUserInteractionEnabled = false; preview.view.accessibilityElementsHidden = true
                     self.addChild(preview); self.view.insertSubview(preview.view, at: 0); preview.didMove(toParent: self)
                     await preview.initialized()
+                    for (group, values) in self.decorations {
+                        preview.apply(decorations: values.map(\.decoration), in: group)
+                    }
+                    await preview.waitForDecorations()
                 }
                 try Task.checkCancellation()
                 // Recompute priorities after every snapshot: rapid turns can move
@@ -1135,6 +1139,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         config.decorationTemplates.keys.contains(style)
     }
 
+    /// Waits for submitted decoration updates before capturing a rendered page.
+    public func waitForDecorations() async {
+        while let task = decorationTasks.values.first { await task.value }
+    }
+
     public func apply(decorations: [Decoration], in group: DecorationGroup) {
         decorationTasks[group]?.cancel()
         var task: Task<Void, Never>?
@@ -1142,10 +1151,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             defer {
                 if let self, self.decorationTasks[group] == task {
                     self.decorationTasks[group] = nil
+                    self.scheduleInteractivePageTurns()
                 }
             }
             guard let self else { return }
             await self.initialized()
+            await self.waitForPendingPageTurns()
 
             guard
                 !Task.isCancelled,
@@ -1154,6 +1165,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return
             }
 
+            var changed = false
             await withTaskGroup(of: Void.self) { tasks in
                 guard !Task.isCancelled else { return }
 
@@ -1163,7 +1175,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     d.locator = self.publication.normalizeLocator(d.locator)
                     return DiffableDecoration(decoration: d)
                 }
+                guard source != target else { return }
+                changed = true
                 self.decorations[group] = target
+                // Cached leaves must never retain an old annotation appearance.
+                // Rebuild the rolling window and seed its renderer with these groups.
+                if self.pageTurnStyle == .curl { self.invalidatePageTurns() }
 
                 if decorations.isEmpty {
                     for (_, pageView) in paginationView.loadedViews {
@@ -1195,6 +1212,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     }
                 }
             }
+            // Fence WebKit rendering, including the decoration layout callbacks,
+            // before the rolling cache can photograph the page again.
+            if changed, !Task.isCancelled { _ = await self.pageTurnSnapshot(cached: true) }
         }
         decorationTasks[group] = task
     }

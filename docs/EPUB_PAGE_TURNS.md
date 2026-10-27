@@ -25,3 +25,10 @@ Five spreads each way would retain eleven images before temporary surfaces and i
 Mirrored app tests cover persistent pager identity, two rapid turns while the first HTML commit is suspended, cancellation, synchronization failure/rollback, duplicate/invalidated callbacks, programmatic cancellation, cache bounds and memory-pressure trimming. Live WebKit integration exercises immediate multi-turn display, forward/backward navigation, edge refill, LTR/RTL, middle/minimum spines and persisted positions. Bookmark and reflow callers wait for HTML synchronization before reading text anchors.
 
 The upstream runner requires the generated TestApp project and xcbeautify; mirrored app tests do not imply a full upstream-suite pass. Physical slow-drag/fast-flip feel, gesture arbitration, fold interruption and memory profiling remain device checks.
+
+
+## Decorations and cached leaves
+
+Decoration updates wait for completed cached turns to synchronize, then invalidate the old bitmap window. After applying a changed group, a WebKit snapshot fences layout before prefetch resumes. No-op group submissions retain the existing cache. Newly created preview renderers receive all saved decoration groups and wait for their application before photographing neighboring pages. `waitForDecorations()` lets clients await submitted changes before taking screenshots or closing an annotation editor.
+
+HTML locator resolution prefers a valid `locations.domRange` whose source text matches the quoted selection, then falls back to quoted text/context when markup has changed. This disambiguates repeated passages and preserves UTF-16 offsets across inline elements. Both fixed and reflowable bundled scripts are rebuilt from `Scripts/src/utils.js` using the existing lockfile. App integration tests exercise exact repeated-text offsets, emoji/inline selections, saved highlights after reopening/reflow, preview decoration propagation, color invalidation and deletion alongside the existing rolling-cache regressions.
