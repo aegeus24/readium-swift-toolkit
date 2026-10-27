@@ -72,8 +72,8 @@ extension ReadiumCSS {
                 // 45em floor can still collapse an explicit two-column request.
                 "column-count": explicitColumnCount(settings),
                 "-webkit-column-count": explicitColumnCount(settings),
-                "column-width": explicitColumnCount(settings).isEmpty ? "" : "auto",
-                "-webkit-column-width": explicitColumnCount(settings).isEmpty ? "" : "auto",
+                "column-width": explicitColumnWidth(settings),
+                "-webkit-column-width": explicitColumnWidth(settings),
                 "font-weight": settings.fontWeight
                     .map { String(format: "%.0f", (Double(CSSStandardFontWeight.normal.rawValue) * $0).clamped(to: 1 ... 1000)) }
                     ?? "",
@@ -87,6 +87,16 @@ extension ReadiumCSS {
         case .one: return "1"
         case .two: return "2"
         case .auto: return ""
+        }
+    }
+
+    private func explicitColumnWidth(_ settings: EPUBSettings) -> String {
+        switch explicitColumnCount(settings) {
+        // Older WebKit needs a definite column width to fragment a one-column
+        // document; count=1 with width=auto otherwise overflows vertically.
+        case "1": return "100vw"
+        case "2": return "auto"
+        default: return ""
         }
     }
 
