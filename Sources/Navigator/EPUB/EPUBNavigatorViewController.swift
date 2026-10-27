@@ -53,6 +53,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var previewTask: Task<Void, Never>?
     private var previewRevision = 0
     private weak var previewNavigator: EPUBNavigatorViewController?
+    private var isPageTurnPreview = false
+
+    /// The hidden raster renderer must never take focus from native sheets or
+    /// the live publication when UIKit forwards appearance to child controllers.
+    override open var canBecomeFirstResponder: Bool {
+        !isPageTurnPreview && super.canBecomeFirstResponder
+    }
     private var interactiveLocators: [Int: Locator] = [:]
     private var interactiveBoundaryLeft: Int?
     private var interactiveBoundaryRight: Int?
@@ -169,6 +176,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     let customOrder = self.readingOrder.map { $0.href } == self.publication.readingOrder.map { $0.href } ? nil : self.readingOrder
                     preview = try EPUBNavigatorViewController(publication: self.publication, initialLocation: origin,
                                                               readingOrder: customOrder, config: config)
+                    preview.isPageTurnPreview = true
                     self.previewNavigator = preview
                     preview.loadViewIfNeeded(); preview.view.frame = self.view.bounds
                     preview.view.isUserInteractionEnabled = false; preview.view.accessibilityElementsHidden = true
