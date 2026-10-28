@@ -38,3 +38,10 @@ HTML locator resolution prefers a valid `locations.domRange` whose source text m
 The warm page-turn preview is raster-only and cannot become first responder. UIKit forwards appearance callbacks when this hidden child is installed or rebuilt; the input-observable base class normally requests keyboard focus on appearance. A preview now opts out through `canBecomeFirstResponder` before its view is loaded/attached, preserving native bookmark/note editing and the live reader's keyboard navigation. The live navigator retains its existing responder behavior.
 
 App regression tests rebuild a preview while a native text field is editing, forward appearance, attempt focus acquisition and verify continuous input. They also host the bookmark sheet above the real reader and check field identity, focus, pagination dimensions and passage retention. Keyboard safe-area avoidance belongs to the native sheet; the app's reader canvas ignores keyboard insets.
+
+
+## Recovering raster prefetch after memory pressure
+
+Memory warnings now drop the hidden navigator and trim distant bitmaps, then refill a reduced one-neighbor window after a one-second cooldown. Completing a turn returns to the normal two-neighbor radius. The previous pressure flag blocked prefetch until a cached turn completed, but trimming all neighbors made that drag impossible. Preparation revisions prevent a cancelled task from clearing its replacement. Missing captures get at most three deferred refill retries; busy navigation cannot mark a permanent publication boundary.
+
+Snapshots wait for a loaded, visible spread rather than photographing the alpha-zero scroll view during chapter initialization. Flat rasters with visible DOM text are retried and never cached as printed leaves; genuinely empty publisher pages are allowed. WebKit process termination invalidates the affected navigator's cache before reloading. App integration tests simulate a hidden spread, memory warning, and repeated forward/reverse refills in one/two columns, checking every prepared text leaf for raster detail. Physical touch/long-session verification remains necessary.

@@ -52,6 +52,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private let interactivePageTurns = EPUBInteractivePageTurnController()
     private var previewTask: Task<Void, Never>?
     private var previewRevision = 0
+    private var previewRetryCount = 0
     private weak var previewNavigator: EPUBNavigatorViewController?
     private var isPageTurnPreview = false
 
@@ -83,11 +84,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         pageTurnAnimator.invalidate()
         interactiveGeneration += 1
         previewTask?.cancel(); previewTask = nil
+        previewRevision += 1
         if let preview = previewNavigator {
             preview.willMove(toParent: nil); preview.view.removeFromSuperview(); preview.removeFromParent()
             previewNavigator = nil
         }
         cacheUnderMemoryPressure = false
+        previewRetryCount = 0
         interactiveLocators.removeAll()
         interactiveBoundaryLeft = nil; interactiveBoundaryRight = nil
         interactivePageTurns.invalidate()
@@ -117,10 +120,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private func scheduleInteractivePageTurns() {
         guard pageTurnStyle == .curl, !settings.scroll, !settings.verticalText, pageTurnsVisible,
               !UIAccessibility.isReduceMotionEnabled, !UIAccessibility.isVoiceOverRunning,
-              !pageTurnAnimator.busy, previewTask == nil, cachedRestoreTask == nil, decorationTasks.isEmpty, !cacheUnderMemoryPressure,
+              !pageTurnAnimator.busy, previewTask == nil, cachedRestoreTask == nil, decorationTasks.isEmpty,
               view.window != nil, let location = currentLocation else { return }
         let current = interactivePageTurns.currentIndex
-        let targets = (current - EPUBInteractivePageTurnController.radius ... current + EPUBInteractivePageTurnController.radius)
+        let radius = cacheUnderMemoryPressure ? 1 : EPUBInteractivePageTurnController.radius
+        let targets = (current - radius ... current + radius)
             .filter { index in
                 !interactivePageTurns.cachedIndices.contains(index) &&
                 !(interactiveBoundaryLeft.map { index <= $0 } ?? false) &&
@@ -133,10 +137,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         previewTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                if revision == self.interactiveGeneration, preparation == self.previewRevision { self.previewTask = nil }
+                if revision == self.interactiveGeneration, preparation == self.previewRevision {
+                    self.previewTask = nil
+                    // Transient WebKit/load failures must not strand the rolling
+                    // window. Bound retries so a broken resource cannot spin.
+                    if !Task.isCancelled, self.previewRetryCount < 3 {
+                        self.previewRetryCount += 1
+                        self.scheduleInteractivePageTurns()
+                    }
+                }
             }
             do {
-                try await Task.sleep(nanoseconds: 100_000_000)
+                try await Task.sleep(nanoseconds: self.cacheUnderMemoryPressure ? 1_000_000_000 : UInt64(100_000_000 * (self.previewRetryCount + 1)))
+                try Task.checkCancellation()
                 guard revision == self.interactiveGeneration, let live = self.paginationView else { return }
                 if self.interactivePageTurns.pager == nil {
                     guard let image = await self.pageTurnSnapshot(cached: true),
@@ -151,6 +164,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         // A running prefetch loop observes the new current index;
                         // otherwise refill only the newly missing edge(s).
                         self?.cacheUnderMemoryPressure = false
+                        self?.previewRetryCount = 0
                         self?.publishCachedLocation()
                         self?.scheduleInteractivePageTurns()
                     }
@@ -194,7 +208,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 while revision == self.interactiveGeneration, !Task.isCancelled {
                     let center = self.interactivePageTurns.currentIndex
                     let preferred = self.settings.readingProgression == .rtl ? -1 : 1
-                    let desired = (1...EPUBInteractivePageTurnController.radius).flatMap { [center + $0 * preferred, center - $0 * preferred] }
+                    let desired = (1...(self.cacheUnderMemoryPressure ? 1 : EPUBInteractivePageTurnController.radius)).flatMap { [center + $0 * preferred, center - $0 * preferred] }
                     guard let index = desired.first(where: {
                         !attempts.contains($0) && !self.interactivePageTurns.cachedIndices.contains($0)
                     }) else { break }
@@ -207,7 +221,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         try Task.checkCancellation()
                         let right = index > cursor
                         guard await preview.move(to: right ? .right : .left, options: .none) else {
-                            if right { self.interactiveBoundaryRight = cursor + 1 } else { self.interactiveBoundaryLeft = cursor - 1 }
+                            // A rejected move can also mean navigation is busy.
+                            // Only remember a boundary after an idle rejection.
+                            if preview.state == .idle {
+                                if right { self.interactiveBoundaryRight = cursor + 1 } else { self.interactiveBoundaryLeft = cursor - 1 }
+                            }
                             break
                         }
                         cursor += right ? 1 : -1
@@ -217,6 +235,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                           let locator = await preview.cachedViewportLocation() else { continue }
                     try Task.checkCancellation()
                     guard revision == self.interactiveGeneration else { return }
+                    self.previewRetryCount = 0
                     self.interactiveLocators[index] = locator
                     self.interactivePageTurns.insert(.init(image: image, commit: { [weak self] in
                         guard let self, revision == self.interactiveGeneration else { return false }
@@ -294,14 +313,40 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                else { await goBackward(options: .init(animated: true)) } }
     }
 
-    private func pageTurnSnapshot(cached: Bool = false) async -> UIImage? {
-        guard let spread = paginationView?.currentView as? EPUBSpreadView,
-              view.window != nil, view.bounds.width > 0, view.bounds.height > 0 else { return nil }
+    func pageTurnSnapshot(cached: Bool = false) async -> UIImage? {
+        // Navigation completion precedes showSpread(), which reveals the
+        // scroll view after chapter layout/decorations. Capturing alpha-zero
+        // content produces a valid but blank bitmap that poisons every curl.
+        for _ in 0..<50 {
+            guard !Task.isCancelled, view.window != nil else { return nil }
+            if let spread = paginationView?.currentView as? EPUBSpreadView,
+               spread.isSpreadLoaded, spread.scrollView.alpha >= 0.99,
+               spread.webView.bounds.width > 0, spread.webView.bounds.height > 0 { break }
+            try? await Task.sleep(nanoseconds: 40_000_000)
+        }
+        guard !Task.isCancelled, let spread = paginationView?.currentView as? EPUBSpreadView,
+              spread.isSpreadLoaded, spread.scrollView.alpha >= 0.99,
+              view.window != nil, view.bounds.width > 0, view.bounds.height > 0,
+              spread.webView.bounds.width > 0, spread.webView.bounds.height > 0 else { return nil }
         let configuration = WKSnapshotConfiguration()
         configuration.afterScreenUpdates = true
         let cachedScale = min(view.window?.screen.scale ?? 2, 1600 / max(view.bounds.width, view.bounds.height))
         configuration.snapshotWidth = NSNumber(value: cached ? spread.webView.bounds.width * cachedScale : min(spread.webView.bounds.width, 1024))
-        guard let webImage = try? await spread.webView.takeSnapshot(configuration: configuration) else { return nil }
+        var captured: UIImage?
+        for _ in 0..<4 {
+            guard !Task.isCancelled, paginationView?.currentView === spread else { return nil }
+            if let image = try? await spread.webView.takeSnapshot(configuration: configuration) {
+                if Self.snapshotHasDetail(image) { captured = image; break }
+                // A genuinely empty publisher page is allowed. A flat raster
+                // where visible text exists is a dropped WebKit paint, not a
+                // usable cache entry. Never retain it as a printed leaf.
+                let hasText = try? await spread.webView.evaluateJavaScript(Self.visiblePageTextScript) as? Bool
+                if hasText == false { captured = image; break }
+            }
+            spread.webView.setNeedsDisplay()
+            try? await Task.sleep(nanoseconds: 80_000_000)
+        }
+        guard let webImage = captured else { return nil }
         // Bound temporary textures on large displays. Each turn retains only two spreads.
         let format = UIGraphicsImageRendererFormat()
         format.scale = cached
@@ -315,6 +360,45 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             webImage.draw(in: rect)
         }
     }
+
+    /// Low-cost raster sanity check; DOM visibility distinguishes legitimate
+    /// blank pages from missing paint. Keep this independent of theme colors.
+    static func snapshotHasDetail(_ image: UIImage) -> Bool {
+        guard let cgImage = image.cgImage else { return false }
+        let side = 256
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        return pixels.withUnsafeMutableBytes { bytes in
+            guard let context = CGContext(data: bytes.baseAddress, width: side, height: side,
+                bitsPerComponent: 8, bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+            let pointer = bytes.bindMemory(to: UInt8.self)
+            for channel in 0..<4 {
+                var low = UInt8.max, high = UInt8.min
+                for offset in stride(from: channel, to: pointer.count, by: 4) {
+                    low = min(low, pointer[offset]); high = max(high, pointer[offset])
+                    if Int(high) - Int(low) > 8 { return true }
+                }
+            }
+            return false
+        }
+    }
+
+    private static let visiblePageTextScript = """
+    (() => {
+      if (!document.body || document.readyState !== 'complete') return true;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if (!node.textContent.trim()) continue;
+        const range = document.createRange(); range.selectNodeContents(node);
+        for (const rect of range.getClientRects()) {
+          if (rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.left < innerWidth && rect.bottom > 0 && rect.top < innerHeight) return true;
+        }
+      }
+      return false;
+    })()
+    """
 
     public struct Configuration {
         /// Initial set of setting preferences.
@@ -748,12 +832,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         super.didReceiveMemoryWarning()
         cacheUnderMemoryPressure = true
         previewTask?.cancel(); previewTask = nil
+        previewRevision += 1
         if let preview = previewNavigator {
             preview.willMove(toParent: nil); preview.view.removeFromSuperview(); preview.removeFromParent()
             previewNavigator = nil
         }
         interactivePageTurns.trim(radius: 0)
         interactiveLocators = interactiveLocators.filter { interactivePageTurns.cachedIndices.contains($0.key) }
+        previewRetryCount = 0
+        // Refill a smaller window after a cooldown. Otherwise no neighboring
+        // leaves remain to trigger didComplete and dragging stays disabled.
+        scheduleInteractivePageTurns()
     }
 
     override open func viewWillDisappear(_ animated: Bool) {
@@ -1588,6 +1677,9 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidTerminate() {
+        // A process restart invalidates the preview's navigation assumptions
+        // and any in-flight captures. Rebuild from the displayed locator.
+        invalidatePageTurns()
         reloadSpreads()
     }
 }

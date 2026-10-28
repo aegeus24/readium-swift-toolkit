@@ -4,6 +4,22 @@ import XCTest
 
 @MainActor
 final class EPUBPageTurnAnimatorTests: XCTestCase {
+    func testSnapshotSanityRejectsUniformLightDarkAndTransparentRasters() {
+        for color in [UIColor.white, .black, .clear] {
+            let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 400)).image { context in
+                color.setFill(); context.fill(CGRect(x: 0, y: 0, width: 300, height: 400))
+            }
+            XCTAssertFalse(EPUBNavigatorViewController.snapshotHasDetail(image))
+        }
+        for dark in [false, true] {
+            let image = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 400)).image { context in
+                (dark ? UIColor.black : .white).setFill(); context.fill(CGRect(x: 0, y: 0, width: 300, height: 400))
+                (dark ? UIColor.white : .black).setFill(); context.fill(CGRect(x: 20, y: 30, width: 120, height: 3))
+            }
+            XCTAssertTrue(EPUBNavigatorViewController.snapshotHasDetail(image))
+        }
+    }
+
     func testCenterSpineLeavesRenderSeparatePhysicalHalves() throws {
         let image = UIGraphicsImageRenderer(size: CGSize(width: 400, height: 200)).image { context in
             UIColor.red.setFill(); context.fill(CGRect(x: 0, y: 0, width: 200, height: 200))
